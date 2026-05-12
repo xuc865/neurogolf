@@ -36,7 +36,7 @@ after this run.
 
 ## Run
 
-Basic ensemble run:
+Basic ensemble run for leaderboard-oriented selection:
 
 ```bash
 python remote_neurogolf/run_remote.py \
@@ -45,10 +45,10 @@ python remote_neurogolf/run_remote.py \
   --work-dir remote_runs/b60 \
   --output-zip remote_runs/b60/final_submission.zip \
   --conv-budget 60 \
-  --include-arcgen
+  --workers 8
 ```
 
-Longer run, usually better but slower:
+Longer leaderboard-oriented run, usually better but slower:
 
 ```bash
 python remote_neurogolf/run_remote.py \
@@ -56,6 +56,19 @@ python remote_neurogolf/run_remote.py \
   --data-dir data \
   --work-dir remote_runs/b180 \
   --output-zip remote_runs/b180/final_submission.zip \
+  --conv-budget 180 \
+  --workers 8
+```
+
+Stricter research run, useful for robustness diagnostics but often too
+conservative for leaderboard selection:
+
+```bash
+python remote_neurogolf/run_remote.py \
+  --repo-root . \
+  --data-dir data \
+  --work-dir remote_runs/b180_arcgen \
+  --output-zip remote_runs/b180_arcgen/final_submission.zip \
   --conv-budget 180 \
   --include-arcgen \
   --workers 8
@@ -70,7 +83,6 @@ python remote_neurogolf/run_remote.py \
   --work-dir remote_runs/b180 \
   --output-zip remote_runs/b180/final_submission.zip \
   --conv-budget 180 \
-  --include-arcgen \
   --submit
 ```
 
@@ -88,7 +100,7 @@ python remote_neurogolf/run_remote.py \
   --output-zip remote_runs/ensemble/final_submission.zip \
   --extra-source /path/to/other_submission.zip \
   --extra-source /path/to/other_models_dir \
-  --include-arcgen
+  --workers 8
 ```
 
 ## What to submit manually
