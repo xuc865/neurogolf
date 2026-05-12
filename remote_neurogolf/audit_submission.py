@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -42,9 +44,11 @@ def main() -> None:
     ap.add_argument("--output-zip", type=Path, default=None)
     ap.add_argument("--include-arcgen", action="store_true")
     ap.add_argument("--repair", action="store_true", help="Replace processing-failing models with safe identity models")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     args = ap.parse_args()
 
     tasks = run_remote.load_tasks(args.data_dir, None)
+    prepared_tasks = {tid: run_remote.prepare_examples(task, args.include_arcgen) for tid, task in tasks.items()}
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         model_dir = load_zip_models(args.input_zip, tmp)
@@ -52,12 +56,17 @@ def main() -> None:
         fallback_dir.mkdir()
         failures = []
 
-        for tid in range(1, run_remote.TASK_COUNT + 1):
+        def audit_one(tid: int) -> tuple[int, bool, str]:
             model_path = model_dir / f"task{tid:03d}.onnx"
             if not model_path.exists():
-                failures.append({"task": tid, "reason": "missing model"})
-                continue
-            ok, reason = run_remote.official_process_ok(model_path, tasks[tid], args.include_arcgen)
+                return tid, False, "missing model"
+            ok, reason = run_remote.official_process_ok_prepared(model_path, prepared_tasks[tid])
+            return tid, ok, reason
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            results = pool.map(audit_one, range(1, run_remote.TASK_COUNT + 1))
+
+        for tid, ok, reason in results:
             if ok:
                 continue
             failures.append({"task": tid, "reason": reason})

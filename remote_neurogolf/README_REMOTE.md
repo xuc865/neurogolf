@@ -57,7 +57,8 @@ python remote_neurogolf/run_remote.py \
   --work-dir remote_runs/b180 \
   --output-zip remote_runs/b180/final_submission.zip \
   --conv-budget 180 \
-  --include-arcgen
+  --include-arcgen \
+  --workers 8
 ```
 
 Submit automatically after packaging:
@@ -127,7 +128,8 @@ Before any manual submission, run the full 400-model audit:
 python remote_neurogolf/audit_submission.py \
   remote_runs/b180/final_submission.zip \
   --data-dir data \
-  --include-arcgen
+  --include-arcgen \
+  --workers 8
 ```
 
 If it reports failures, repair every processing-failing task with a guaranteed
@@ -138,9 +140,18 @@ python remote_neurogolf/audit_submission.py \
   remote_runs/b180/final_submission.zip \
   --data-dir data \
   --include-arcgen \
+  --workers 8 \
   --repair \
   --output-zip remote_runs/b180/final_submission_processing_clean.zip
 ```
 
 Submit `final_submission_processing_clean.zip` only after the audit reports
 `failure_count: 0`.
+
+## Efficiency Notes
+
+The runner is CPU-only. It now caches one-hot encoded examples and evaluates
+each candidate with one official-style profiled pass instead of a separate
+validation pass plus a scoring pass. `--workers` controls parallel candidate
+validation; a good starting value is physical CPU cores or slightly less. If the
+server becomes memory-bound, lower `--workers`.

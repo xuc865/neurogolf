@@ -11,6 +11,7 @@ submit through the Kaggle CLI.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import itertools
 import json
 import math
@@ -18,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import zipfile
@@ -49,6 +51,12 @@ class Candidate:
     memory: int
     params: int
     valid_examples: int
+
+
+@dataclass(frozen=True)
+class PreparedExample:
+    inp: np.ndarray
+    exp: np.ndarray
 
 
 def log(msg: str) -> None:
@@ -112,6 +120,16 @@ def examples_for(task: dict[str, Any], include_arcgen: bool) -> list[dict[str, A
     return examples
 
 
+def prepare_examples(task: dict[str, Any], include_arcgen: bool) -> list[PreparedExample]:
+    prepared: list[PreparedExample] = []
+    for ex in examples_for(task, include_arcgen):
+        inp = to_onehot(ex["input"])
+        exp = to_onehot(ex["output"])
+        if inp is not None and exp is not None:
+            prepared.append(PreparedExample(inp, exp))
+    return prepared
+
+
 def sanitize_for_official_processing(model: onnx.ModelProto) -> onnx.ModelProto | None:
     model = onnx.ModelProto().FromString(model.SerializeToString())
     for node in model.graph.node:
@@ -121,6 +139,18 @@ def sanitize_for_official_processing(model: onnx.ModelProto) -> onnx.ModelProto 
         if "kernel_time" in node.name:
             return None
     return model
+
+
+def make_session_options(enable_profiling: bool = False) -> ort.SessionOptions:
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    if enable_profiling:
+        options.enable_profiling = True
+        prefix = Path(tempfile.gettempdir()) / f"ng_profile_{os.getpid()}_{time.time_ns()}"
+        options.profile_file_prefix = str(prefix)
+    return options
 
 
 def validate_model(model_path: Path, task: dict[str, Any], include_arcgen: bool) -> int:
@@ -138,8 +168,7 @@ def validate_model(model_path: Path, task: dict[str, Any], include_arcgen: bool)
             if attr.type in (onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS):
                 return 0
 
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options = make_session_options()
     sess = ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"])
     ok = 0
     for ex in examples_for(task, include_arcgen):
@@ -161,20 +190,25 @@ def run_examples_with_profile(
     include_arcgen: bool,
     require_correct: bool,
 ) -> str | None:
-    options = ort.SessionOptions()
-    options.enable_profiling = True
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    options.profile_file_prefix = "ng_profile"
+    return run_prepared_examples_with_profile(
+        model,
+        prepare_examples(task, include_arcgen),
+        require_correct=require_correct,
+    )
+
+
+def run_prepared_examples_with_profile(
+    model: onnx.ModelProto,
+    examples: list[PreparedExample],
+    require_correct: bool,
+) -> str | None:
+    options = make_session_options(enable_profiling=True)
     sess = ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"])
     ran = False
-    for ex in examples_for(task, include_arcgen):
-        inp = to_onehot(ex["input"])
-        exp = to_onehot(ex["output"])
-        if inp is None or exp is None:
-            continue
-        out = sess.run(["output"], {"input": inp})[0]
+    for ex in examples:
+        out = sess.run(["output"], {"input": ex.inp})[0]
         ran = True
-        if require_correct and not np.array_equal((out > 0.0).astype(np.float32), exp):
+        if require_correct and not np.array_equal((out > 0.0).astype(np.float32), ex.exp):
             sess.end_profiling()
             return None
     return sess.end_profiling() if ran else None
@@ -354,6 +388,30 @@ def official_score(model_path: Path, task: dict[str, Any], include_arcgen: bool)
     return max(1.0, 25.0 - math.log(cost)), cost, memory, params
 
 
+def score_sanitized_model(
+    model: onnx.ModelProto,
+    examples: list[PreparedExample],
+    require_correct: bool,
+) -> tuple[float, float, int, int, int] | None:
+    trace = run_prepared_examples_with_profile(model, examples, require_correct=require_correct)
+    if not trace:
+        return None
+    try:
+        memory = official_memory(model, trace)
+    finally:
+        try:
+            Path(trace).unlink()
+        except OSError:
+            pass
+    if memory is None or memory < 0:
+        return None
+    params = count_params(model)
+    if params < 0 or params >= 10**12:
+        return None
+    cost = max(1.0, float(memory + params))
+    return max(1.0, 25.0 - math.log(cost)), cost, memory, params, len(examples)
+
+
 def official_process_ok(model_path: Path, task: dict[str, Any], include_arcgen: bool) -> tuple[bool, str]:
     try:
         model = sanitize_for_official_processing(onnx.load(str(model_path)))
@@ -377,6 +435,39 @@ def official_process_ok(model_path: Path, task: dict[str, Any], include_arcgen: 
         return True, "ok"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def official_process_ok_prepared(model_path: Path, examples: list[PreparedExample]) -> tuple[bool, str]:
+    try:
+        model = sanitize_for_official_processing(onnx.load(str(model_path)))
+        if model is None:
+            return False, "node without output or node name containing kernel_time"
+        scored = score_sanitized_model(model, examples, require_correct=False)
+        if scored is None:
+            return False, "official processing failed"
+        return True, "ok"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def evaluate_candidate(
+    source_name: str,
+    model_path: Path,
+    examples: list[PreparedExample],
+) -> Candidate | None:
+    try:
+        if model_path.stat().st_size > FILESIZE_LIMIT:
+            return None
+        model = sanitize_for_official_processing(onnx.load(str(model_path)))
+        if model is None:
+            return None
+        scored = score_sanitized_model(model, examples, require_correct=True)
+        if scored is None:
+            return None
+        score, cost, memory, params, valid_examples = scored
+        return Candidate(source_name, model_path, score, cost, memory, params, valid_examples)
+    except Exception:
+        return None
 
 
 def candidate_dirs_from_repo(repo: Path) -> list[tuple[str, Path]]:
@@ -448,29 +539,33 @@ def run_ash(work: Path, tasks_json: Path, conv_budget: int) -> Path | None:
 def collect_candidates(
     sources: list[tuple[str, Path]],
     tasks: dict[int, dict[str, Any]],
+    prepared_tasks: dict[int, list[PreparedExample]],
     include_arcgen: bool,
     work: Path,
+    workers: int,
 ) -> dict[int, list[Candidate]]:
     by_task: dict[int, list[Candidate]] = {tid: [] for tid in range(1, TASK_COUNT + 1)}
     for source in sources:
         source_name, source_dir = materialize_source(source, work)
         log(f"Validating source: {source_name} ({source_dir})")
+        jobs = []
         for tid in range(1, TASK_COUNT + 1):
-            p = source_dir / f"task{tid:03d}.onnx"
-            if not p.exists():
-                continue
-            try:
-                n_ok = validate_model(p, tasks[tid], include_arcgen)
-                if not n_ok:
-                    continue
-                scored = official_score(p, tasks[tid], include_arcgen)
-                if scored is None:
-                    continue
-                score, cost, memory, params = scored
-                by_task[tid].append(Candidate(source_name, p, score, cost, memory, params, n_ok))
-            except Exception as exc:
-                if tid <= 5:
-                    log(f"  skip {source_name} task{tid:03d}: {exc}")
+            model_path = source_dir / f"task{tid:03d}.onnx"
+            if model_path.exists():
+                jobs.append((tid, model_path))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            future_to_tid = {
+                pool.submit(evaluate_candidate, source_name, path, prepared_tasks[tid]): tid
+                for tid, path in jobs
+            }
+            accepted = 0
+            for future in concurrent.futures.as_completed(future_to_tid):
+                tid = future_to_tid[future]
+                candidate = future.result()
+                if candidate is not None:
+                    by_task[tid].append(candidate)
+                    accepted += 1
+            log(f"  accepted {accepted}/{len(jobs)} candidates from {source_name}")
     return by_task
 
 
@@ -488,6 +583,7 @@ def make_identity_model(path: Path) -> None:
 def package_best(
     by_task: dict[int, list[Candidate]],
     tasks: dict[int, dict[str, Any]],
+    prepared_tasks: dict[int, list[PreparedExample]],
     include_arcgen: bool,
     work: Path,
     output_zip: Path,
@@ -505,22 +601,24 @@ def package_best(
             fallback = fallback_dir / f"task{tid:03d}.onnx"
             if not fallback.exists():
                 make_identity_model(fallback)
-            n_ok = validate_model(fallback, tasks[tid], include_arcgen)
-            scored = official_score(fallback, tasks[tid], include_arcgen)
-            score, cost, memory, params = scored if scored is not None else model_score(fallback)
-            best = Candidate("fallback_identity", fallback, score if n_ok else 1.0, cost, memory, params, n_ok)
+            scored = evaluate_candidate("fallback_identity", fallback, prepared_tasks[tid])
+            if scored is None:
+                score, cost, memory, params = model_score(fallback)
+                best = Candidate("fallback_identity", fallback, 1.0, cost, memory, params, 0)
+            else:
+                best = scored
         else:
             best = sorted(candidates, key=lambda c: (c.score, -c.cost), reverse=True)[0]
             solved += 1
         final_path = final_dir / f"task{tid:03d}.onnx"
         shutil.copy2(best.path, final_path)
-        process_ok, process_reason = official_process_ok(final_path, tasks[tid], include_arcgen)
+        process_ok, process_reason = official_process_ok_prepared(final_path, prepared_tasks[tid])
         if not process_ok:
             fallback = fallback_dir / f"task{tid:03d}.onnx"
             if not fallback.exists():
                 make_identity_model(fallback)
             shutil.copy2(fallback, final_path)
-            fallback_ok, fallback_reason = official_process_ok(final_path, tasks[tid], include_arcgen)
+            fallback_ok, fallback_reason = official_process_ok_prepared(final_path, prepared_tasks[tid])
             if not fallback_ok:
                 raise SystemExit(f"Safe fallback failed processing for task{tid:03d}: {fallback_reason}")
             processing_replacements.append({"task": tid, "source": best.source, "reason": process_reason})
@@ -572,6 +670,7 @@ def main() -> None:
     ap.add_argument("--skip-public-solvers", action="store_true")
     ap.add_argument("--extra-source", type=Path, action="append", default=[],
                     help="Extra directory or zip containing task001.onnx ... task400.onnx")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--min-submit-score", type=float, default=6000.0)
     ap.add_argument("--submit", action="store_true")
     args = ap.parse_args()
@@ -580,6 +679,7 @@ def main() -> None:
     work = ensure_dir(args.work_dir.resolve())
     data_dir = args.data_dir or (repo / "data")
     tasks = load_tasks(data_dir if data_dir.exists() else None, args.data_file)
+    prepared_tasks = {tid: prepare_examples(task, args.include_arcgen) for tid, task in tasks.items()}
     tasks_json = write_all_tasks_json(tasks, work / "all_tasks.json")
 
     sources = candidate_dirs_from_repo(repo)
@@ -602,8 +702,8 @@ def main() -> None:
         except Exception as exc:
             log(f"rogermt solver failed: {exc}")
 
-    by_task = collect_candidates(sources, tasks, args.include_arcgen, work)
-    report = package_best(by_task, tasks, args.include_arcgen, work, args.output_zip.resolve())
+    by_task = collect_candidates(sources, tasks, prepared_tasks, args.include_arcgen, work, args.workers)
+    report = package_best(by_task, tasks, prepared_tasks, args.include_arcgen, work, args.output_zip.resolve())
 
     print("\n=== FINAL ===")
     print(f"zip: {report['zip']}")
