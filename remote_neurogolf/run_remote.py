@@ -505,13 +505,18 @@ def run_rogermt(work: Path, tasks_json: Path, conv_budget: int) -> Path | None:
     raw = json.loads(tasks_json.read_text())
     for i, key in enumerate(sorted(raw.keys()), 1):
         (data_dir / f"task{i:03d}.json").write_text(json.dumps(raw[key], separators=(",", ":")))
-    cmd = [
-        sys.executable, "-m", "neurogolf_solver.main",
-        "--kaggle", "--data_dir", str(data_dir),
-        "--output_dir", str(out),
-        "--conv_budget", str(conv_budget),
+    commands = [
+        [sys.executable, "-m", "neurogolf_solver.main", "--kaggle", "--data_dir", str(data_dir), "--output_dir", str(out), "--conv_budget", str(conv_budget)],
+        [sys.executable, "-m", "neurogolf_solver.main", "--data-dir", str(data_dir), "--output-dir", str(out), "--conv-budget", str(conv_budget)],
+        [sys.executable, "own-solver/main.py", "--data_dir", str(data_dir), "--output_dir", str(out), "--conv_budget", str(conv_budget)],
+        [sys.executable, "main.py", "--data_dir", str(data_dir), "--output_dir", str(out), "--conv_budget", str(conv_budget)],
     ]
-    run(cmd, cwd=repo, check=False)
+    for cmd in commands:
+        proc = run(cmd, cwd=repo, check=False)
+        found = len(list(out.glob("task*.onnx")))
+        log(f"  rogermt command exit={proc.returncode}, produced {found} models")
+        if found >= 100:
+            break
     return out if len(list(out.glob("task*.onnx"))) >= 100 else None
 
 
@@ -527,12 +532,17 @@ def run_ash(work: Path, tasks_json: Path, conv_budget: int) -> Path | None:
             log(f"download failed: {exc}")
     if not script.exists():
         return None
-    run([
-        sys.executable, str(script),
-        "--data_file", str(tasks_json),
-        "--output_dir", str(out),
-        "--conv_budget", str(conv_budget),
-    ], check=False)
+    commands = [
+        [sys.executable, str(script), "--data_file", str(tasks_json), "--output_dir", str(out), "--conv_budget", str(conv_budget)],
+        [sys.executable, str(script), "--data-file", str(tasks_json), "--output-dir", str(out), "--conv-budget", str(conv_budget)],
+        [sys.executable, str(script), str(tasks_json), str(out)],
+    ]
+    for cmd in commands:
+        proc = run(cmd, check=False)
+        found = len(list(out.glob("task*.onnx")))
+        log(f"  ash command exit={proc.returncode}, produced {found} models")
+        if found >= 100:
+            break
     return out if len(list(out.glob("task*.onnx"))) >= 100 else None
 
 
@@ -543,8 +553,9 @@ def collect_candidates(
     include_arcgen: bool,
     work: Path,
     workers: int,
-) -> dict[int, list[Candidate]]:
+) -> tuple[dict[int, list[Candidate]], list[dict[str, Any]]]:
     by_task: dict[int, list[Candidate]] = {tid: [] for tid in range(1, TASK_COUNT + 1)}
+    source_stats: list[dict[str, Any]] = []
     for source in sources:
         source_name, source_dir = materialize_source(source, work)
         log(f"Validating source: {source_name} ({source_dir})")
@@ -566,7 +577,13 @@ def collect_candidates(
                     by_task[tid].append(candidate)
                     accepted += 1
             log(f"  accepted {accepted}/{len(jobs)} candidates from {source_name}")
-    return by_task
+            source_stats.append({
+                "source": source_name,
+                "path": str(source_dir),
+                "models_found": len(jobs),
+                "accepted": accepted,
+            })
+    return by_task, source_stats
 
 
 def make_identity_model(path: Path) -> None:
@@ -593,6 +610,8 @@ def package_best(
     fallback_dir = ensure_dir(work / "fallback")
     rows = []
     processing_replacements = []
+    source_counts: dict[str, int] = {}
+    source_scores: dict[str, float] = {}
     total = 0.0
     solved = 0
     for tid in range(1, TASK_COUNT + 1):
@@ -624,6 +643,8 @@ def package_best(
             processing_replacements.append({"task": tid, "source": best.source, "reason": process_reason})
             best = Candidate("processing_safe_identity", final_path, 1.0, best.cost, best.memory, best.params, 0)
         total += best.score if best.valid_examples else 1.0
+        source_counts[best.source] = source_counts.get(best.source, 0) + 1
+        source_scores[best.source] = source_scores.get(best.source, 0.0) + (best.score if best.valid_examples else 1.0)
         rows.append({
             "task": tid,
             "source": best.source,
@@ -646,6 +667,8 @@ def package_best(
         "estimated_score": total,
         "valid_task_count": solved,
         "processing_replacements": processing_replacements,
+        "source_counts": source_counts,
+        "source_scores": source_scores,
         "zip": str(output_zip),
         "zip_size": output_zip.stat().st_size,
         "rows": rows,
@@ -693,23 +716,35 @@ def main() -> None:
             ash = run_ash(work, tasks_json, args.conv_budget)
             if ash:
                 sources.append((ash.name, ash))
+            else:
+                log("ash solver did not produce enough task*.onnx files")
         except Exception as exc:
             log(f"ash solver failed: {exc}")
         try:
             roger = run_rogermt(work, tasks_json, args.conv_budget)
             if roger:
                 sources.append((roger.name, roger))
+            else:
+                log("rogermt solver did not produce enough task*.onnx files")
         except Exception as exc:
             log(f"rogermt solver failed: {exc}")
 
-    by_task = collect_candidates(sources, tasks, prepared_tasks, args.include_arcgen, work, args.workers)
+    by_task, source_stats = collect_candidates(sources, tasks, prepared_tasks, args.include_arcgen, work, args.workers)
     report = package_best(by_task, tasks, prepared_tasks, args.include_arcgen, work, args.output_zip.resolve())
+    report["source_stats"] = source_stats
+    (work / "final_report.json").write_text(json.dumps(report, indent=2))
 
     print("\n=== FINAL ===")
     print(f"zip: {report['zip']}")
     print(f"zip_size: {report['zip_size']:,} bytes")
     print(f"valid_task_count: {report['valid_task_count']}/{TASK_COUNT}")
     print(f"estimated_score: {report['estimated_score']:.3f}")
+    print("source_counts:")
+    for source, count in sorted(report["source_counts"].items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {source}: {count}")
+    print("source_stats:")
+    for item in source_stats:
+        print(f"  {item['source']}: accepted {item['accepted']}/{item['models_found']}")
     print(f"report: {work / 'final_report.json'}")
 
     if args.submit:
