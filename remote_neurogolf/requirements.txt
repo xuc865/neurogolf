@@ -1,0 +1,6 @@
+numpy>=1.24
+onnx>=1.16
+onnxruntime>=1.17
+onnx-tool>=0.9
+kaggle>=1.6.17
+huggingface-hub>=0.23

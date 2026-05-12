@@ -1,0 +1,15 @@
+.DS_Store
+__MACOSX/
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
+
+remote_runs/
+.kaggle/
+kaggle.json
+
+*.log
+ng_profile*.json
