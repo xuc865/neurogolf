@@ -36,6 +36,27 @@ after this run.
 
 ## Run
 
+## Recommended Submission Workflow
+
+Because Kaggle's hidden leaderboard score is the source of truth, use the known
+good submission as the baseline and preserve it unless a model fails ONNX
+processing. This avoids replacing high-LB models with candidates that only look
+better under an imperfect local estimate.
+
+```bash
+python remote_neurogolf/run_remote.py \
+  --repo-root . \
+  --data-dir data \
+  --work-dir remote_runs/preserve_baseline \
+  --output-zip remote_runs/preserve_baseline/final_submission.zip \
+  --preserve-source submission_opt2.zip \
+  --conv-budget 180 \
+  --workers 8
+```
+
+If your known 4763.83 submission zip has a different filename, use that file for
+`--preserve-source`.
+
 Basic ensemble run for leaderboard-oriented selection:
 
 ```bash

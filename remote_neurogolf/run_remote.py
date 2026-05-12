@@ -604,6 +604,7 @@ def package_best(
     include_arcgen: bool,
     work: Path,
     output_zip: Path,
+    preserve_dir: Path | None = None,
 ) -> dict[str, Any]:
     ensure_dir(output_zip.parent)
     final_dir = ensure_dir(work / "final_submission")
@@ -615,8 +616,20 @@ def package_best(
     total = 0.0
     solved = 0
     for tid in range(1, TASK_COUNT + 1):
+        preserved = preserve_dir / f"task{tid:03d}.onnx" if preserve_dir else None
+        if preserved and preserved.exists():
+            process_ok, process_reason = official_process_ok_prepared(preserved, prepared_tasks[tid])
+            if process_ok:
+                score, cost, memory, params = model_score(preserved)
+                best = Candidate("preserved_baseline", preserved, score, cost, memory, params, len(prepared_tasks[tid]))
+            else:
+                processing_replacements.append({"task": tid, "source": "preserved_baseline", "reason": process_reason})
+                best = None
+        else:
+            best = None
+
         candidates = by_task[tid]
-        if not candidates:
+        if best is None and not candidates:
             fallback = fallback_dir / f"task{tid:03d}.onnx"
             if not fallback.exists():
                 make_identity_model(fallback)
@@ -626,7 +639,7 @@ def package_best(
                 best = Candidate("fallback_identity", fallback, 1.0, cost, memory, params, 0)
             else:
                 best = scored
-        else:
+        elif best is None:
             best = sorted(candidates, key=lambda c: (c.score, -c.cost), reverse=True)[0]
             solved += 1
         final_path = final_dir / f"task{tid:03d}.onnx"
@@ -693,6 +706,8 @@ def main() -> None:
     ap.add_argument("--skip-public-solvers", action="store_true")
     ap.add_argument("--extra-source", type=Path, action="append", default=[],
                     help="Extra directory or zip containing task001.onnx ... task400.onnx")
+    ap.add_argument("--preserve-source", type=Path, default=None,
+                    help="Baseline zip or directory to preserve as final output except processing-failing tasks")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--min-submit-score", type=float, default=6000.0)
     ap.add_argument("--submit", action="store_true")
@@ -710,6 +725,10 @@ def main() -> None:
         if extra.exists():
             sources.append((extra.stem, extra.resolve()))
     log(f"Existing candidate sources: {[s[0] for s in sources]}")
+    preserve_dir = None
+    if args.preserve_source:
+        _, preserve_dir = materialize_source(("preserved_baseline", args.preserve_source.resolve()), work)
+        log(f"Preserving baseline source: {preserve_dir}")
 
     if not args.skip_public_solvers:
         try:
@@ -730,7 +749,7 @@ def main() -> None:
             log(f"rogermt solver failed: {exc}")
 
     by_task, source_stats = collect_candidates(sources, tasks, prepared_tasks, args.include_arcgen, work, args.workers)
-    report = package_best(by_task, tasks, prepared_tasks, args.include_arcgen, work, args.output_zip.resolve())
+    report = package_best(by_task, tasks, prepared_tasks, args.include_arcgen, work, args.output_zip.resolve(), preserve_dir)
     report["source_stats"] = source_stats
     (work / "final_report.json").write_text(json.dumps(report, indent=2))
 
